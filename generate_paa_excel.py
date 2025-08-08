@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, io, json, time, math, re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 import streamlit as st
 import pandas as pd
 import requests
@@ -45,9 +45,11 @@ dry_run        = st.sidebar.checkbox("Dry-run (aucun appel API)", value=False)
 limit_rows     = st.sidebar.number_input("Limiter n premières lignes (0 = toutes)", min_value=0, value=0, step=1)
 st.sidebar.markdown("---")
 
-st.sidebar.markdown("### 🔐 Clé API")
+st.sidebar.markdown("### 🔐 Clé & contexte OpenAI")
 api_key_source = st.sidebar.radio("Où lire la clé ?", ["st.secrets", "Variable d'environnement"], index=0)
 st.sidebar.caption("Ajoute OPENAI_API_KEY dans `.streamlit/secrets.toml` ou exporte la variable d’environnement.")
+st.sidebar.text_input("OpenAI Organization (optionnel)", os.getenv("OPENAI_ORG_ID", ""), key="org_hint", disabled=True)
+st.sidebar.text_input("OpenAI Project (optionnel)", os.getenv("OPENAI_PROJECT", ""), key="proj_hint", disabled=True)
 
 # Sélecteur de la source de catégorie (ton fichier n’a pas de colonne Catégorie)
 cat_source = st.sidebar.radio(
@@ -141,14 +143,34 @@ else:
     CATEGORY_RULES, FALLBACK_ANGLES = DEFAULT_CATEGORY_RULES, DEFAULT_FALLBACK_ANGLES
 
 # =============================
-# Utilitaires
+# Utilitaires (auth + similitudes)
 # =============================
-def get_api_key() -> str:
-    if dry_run:
-        return ""  # pas d’API requise
+def mask_key(k: str) -> str:
+    if not k: return "—"
+    k = k.strip()
+    return f"{k[:7]}…{k[-4:]}" if len(k) > 12 else "clé trop courte"
+
+def get_openai_auth() -> Tuple[str, str, str]:
+    """
+    Retourne (api_key, org_id, project_id) en lisant st.secrets OU env.
+    Strip des espaces pour éviter le 401 si un retour chariot s’est glissé.
+    """
     if api_key_source == "st.secrets":
-        return st.secrets.get("OPENAI_API_KEY", "")
-    return os.getenv("OPENAI_API_KEY", "")
+        api_key = (st.secrets.get("OPENAI_API_KEY", "") or "").strip()
+        org_id  = (st.secrets.get("OPENAI_ORG_ID", "") or "").strip()
+        proj_id = (st.secrets.get("OPENAI_PROJECT", "") or "").strip()
+    else:
+        api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+        org_id  = (os.getenv("OPENAI_ORG_ID", "") or "").strip()
+        proj_id = (os.getenv("OPENAI_PROJECT", "") or "").strip()
+    return api_key, org_id, proj_id
+
+def build_headers(api_key: str, org_id: str = "", proj_id: str = "") -> Dict[str, str]:
+    h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    # Ces en-têtes sont optionnels ; utiles si votre org/projet est requis côté compte
+    if org_id:  h["OpenAI-Organization"] = org_id
+    if proj_id: h["OpenAI-Project"] = proj_id
+    return h
 
 def normalize(s: str) -> str:
     s = s.lower()
@@ -193,23 +215,24 @@ def _post_with_retries(url: str, payload: dict, headers: dict, max_retries: int 
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(wait); wait = min(wait*2, 8.0); continue
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        except requests.RequestException:
+        except requests.RequestException as e:
             time.sleep(wait); wait = min(wait*2, 8.0)
     raise RuntimeError("Échec API après retries")
 
-def openai_chat(messages: List[Dict], model: str, temperature: float, api_key: str) -> str:
+def openai_chat(messages: List[Dict], model: str, temperature: float,
+                api_key: str, org_id: str, proj_id: str) -> str:
     url = "https://api.openai.com/v1/chat/completions"
     payload = {"model": model, "messages": messages, "temperature": temperature, "n": 1}
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = build_headers(api_key, org_id, proj_id)
     data = _post_with_retries(url, payload, headers)
     return data["choices"][0]["message"]["content"]
 
-def get_embedding(text: str, model: str, api_key: str) -> List[float]:
+def get_embedding(text: str, model: str, api_key: str, org_id: str, proj_id: str) -> List[float]:
     key = text.strip()
     if key in EMB_CACHE: return EMB_CACHE[key]
     url = "https://api.openai.com/v1/embeddings"
     payload = {"model": model, "input": key}
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = build_headers(api_key, org_id, proj_id)
     data = _post_with_retries(url, payload, headers)
     vec = data["data"][0]["embedding"]
     EMB_CACHE[key] = vec
@@ -271,13 +294,13 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
                      cat_state: Dict[str, Dict[str, list]],
                      attempts: int, ans_min: int, ans_max: int,
                      max_qa: int, chat_model: str, emb_model: str,
-                     use_embeddings: bool, dry_run: bool, api_key: str,
+                     use_embeddings: bool, dry_run: bool,
+                     api_key: str, org_id: str, proj_id: str,
                      jaccard_thr: float, cosine_thr: float) -> List[Dict[str,str]]:
 
     cat_key = category or "_GLOBAL_"
     if cat_key not in cat_state: cat_state[cat_key] = {"qs": [], "embs": []}
 
-    # Angles pilotés par la catégorie (ou mots-clés si tu l'as choisi en sidebar)
     angles = angles_for_category(category)
     avoid_norm = {normalize(q) for q in avoid_line_qs}
 
@@ -294,7 +317,8 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
             content = openai_chat(
                 [{"role":"system","content":system_prompt(ans_min, ans_max)},
                  {"role":"user","content":user_prompt(category, keywords, angles, list(avoid_norm), max_qa, ans_min, ans_max)}],
-                model=chat_model, temperature=0.35 if attempt == 0 else 0.6, api_key=api_key
+                model=chat_model, temperature=0.35 if attempt == 0 else 0.6,
+                api_key=api_key, org_id=org_id, proj_id=proj_id
             )
             candidates = parse_pairs(content, ans_min, ans_max)
 
@@ -313,7 +337,7 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
 
         # Filtre embeddings (sémantique)
         if use_embeddings and not dry_run and filtered:
-            cand_embs = [get_embedding(p["q"], emb_model, api_key) for p in filtered]
+            cand_embs = [get_embedding(p["q"], emb_model, api_key, org_id, proj_id) for p in filtered]
             keep = []
             for i, ei in enumerate(cand_embs):
                 ok = True
@@ -331,7 +355,7 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
         # MàJ historique
         cat_state[cat_key]["qs"].extend([p["q"] for p in final])
         if use_embeddings and not dry_run:
-            cat_state[cat_key]["embs"].extend([get_embedding(p["q"], emb_model, api_key) for p in final])
+            cat_state[cat_key]["embs"].extend([get_embedding(p["q"], emb_model, api_key, org_id, proj_id) for p in final])
 
         # suffisant ? sinon retente
         if len(final) >= max(5, max_qa - 2) or attempt == attempts - 1:
@@ -387,7 +411,7 @@ with col1:
 with col2:
     st.write("Colonnes minimales : **Adresse | Mots clés**")
 
-# Validation colonnes minimales (Priorité devient optionnelle)
+# Validation colonnes minimales (Priorité optionnelle)
 required_cols = ["Adresse", "Mots clés"]
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
@@ -406,11 +430,14 @@ start = st.button("🚀 Générer les PAA")
 if not start:
     st.stop()
 
-# Vérif clé API si nécessaire
-api_key = get_api_key()
-if not dry_run and not api_key:
-    st.error("Aucune clé API détectée. Ajoute `OPENAI_API_KEY` dans `st.secrets` ou en variable d’environnement, ou coche Dry-run.")
-    st.stop()
+# Auth OpenAI
+api_key, org_id, proj_id = ("", "", "")
+if not dry_run:
+    api_key, org_id, proj_id = get_openai_auth()
+    st.caption(f"Clé détectée : {mask_key(api_key)}  |  Org: {org_id or '—'}  |  Project: {proj_id or '—'}")
+    if not api_key:
+        st.error("Aucune clé API détectée. Ajoute `OPENAI_API_KEY` dans `st.secrets` ou en variable d’environnement, ou coche Dry-run.")
+        st.stop()
 
 # Pipeline
 out = df.copy()
@@ -443,7 +470,8 @@ for idx in range(total):
             cat_state=cat_state, attempts=attempts,
             ans_min=ans_min, ans_max=ans_max, max_qa=max_qa,
             chat_model=chat_model, emb_model=emb_model,
-            use_embeddings=use_embeddings, dry_run=dry_run, api_key=api_key,
+            use_embeddings=use_embeddings, dry_run=dry_run,
+            api_key=api_key, org_id=org_id, proj_id=proj_id,
             jaccard_thr=jaccard_thr, cosine_thr=cosine_thr
         )
     except Exception as e:
@@ -473,4 +501,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Astuce : utilise **Dry-run** pour valider le flux sans consommer l’API. Active ensuite les embeddings pour maximiser la diversité.")
+st.caption("Astuce : si tu vois encore un **401**, vérifie que la clé dans `st.secrets['OPENAI_API_KEY']` est exacte, sans espace ni retour à la ligne, et que tu as bien sélectionné *st.secrets* dans la barre latérale. Si ton compte exige un **Organization** ou **Project**, ajoute `OPENAI_ORG_ID` et/ou `OPENAI_PROJECT` dans les secrets.")
