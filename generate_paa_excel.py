@@ -49,6 +49,13 @@ st.sidebar.markdown("### 🔐 Clé API")
 api_key_source = st.sidebar.radio("Où lire la clé ?", ["st.secrets", "Variable d'environnement"], index=0)
 st.sidebar.caption("Ajoute OPENAI_API_KEY dans `.streamlit/secrets.toml` ou exporte la variable d’environnement.")
 
+# Sélecteur de la source de catégorie (ton fichier n’a pas de colonne Catégorie)
+cat_source = st.sidebar.radio(
+    "Source de la catégorie",
+    ["Colonne Catégorie", "Mots clés (fallback volontaire)"],
+    index=1  # par défaut: Mots clés
+)
+
 # =============================
 # Règles d’angles par catégorie (optionnel YAML)
 # =============================
@@ -270,6 +277,7 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
     cat_key = category or "_GLOBAL_"
     if cat_key not in cat_state: cat_state[cat_key] = {"qs": [], "embs": []}
 
+    # Angles pilotés par la catégorie (ou mots-clés si tu l'as choisi en sidebar)
     angles = angles_for_category(category)
     avoid_norm = {normalize(q) for q in avoid_line_qs}
 
@@ -338,9 +346,9 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
 st.title("🧩 Générateur de PAA – Centré produit")
 
 st.markdown("""
-Charge un **Excel** et génère des **People Also Ask** variés, adaptés à chaque **catégorie**.  
-- Forte **diversité** (Jaccard + embeddings optionnels)  
-- Règle marque : “Achel par Lemahieu” → **“Maison Lemahieu”**  
+Charge un **Excel** et génère des **People Also Ask** variés, adaptés à chaque **catégorie**.
+- Forte **diversité** (Jaccard + embeddings optionnels)
+- Règle marque : “Achel par Lemahieu” → **“Maison Lemahieu”**
 - Résultats **Q1..Q8 / A1..A8** réécrits/complétés dans un **nouvel Excel** téléchargeable.
 """)
 
@@ -357,7 +365,7 @@ df = pd.read_excel(uploaded, sheet_name=sheet_name, engine="openpyxl")
 st.write("Aperçu (5 premières lignes) :")
 st.dataframe(df.head())
 
-# Détection OBLIGATOIRE de la colonne Catégorie (aucun fallback Mots clés)
+# Détection éventuelle d'une colonne Catégorie
 cat_col = None
 for cand in ["Catégorie", "Categorie", "Catégorie produit", "Categorie produit"]:
     if cand in df.columns:
@@ -366,18 +374,21 @@ for cand in ["Catégorie", "Categorie", "Catégorie produit", "Categorie produit
 
 col1, col2 = st.columns(2)
 with col1:
-    if cat_col:
-        st.success(f"Colonne de Catégorie détectée : **{cat_col}**")
+    if cat_source == "Colonne Catégorie":
+        if cat_col:
+            st.success(f"Colonne de Catégorie détectée : **{cat_col}**")
+        else:
+            st.error("Aucune colonne de **Catégorie** détectée. "
+                     "Ajoutez une colonne `Catégorie`/`Categorie` ou sélectionnez "
+                     "**Mots clés (fallback volontaire)** dans la barre latérale.")
+            st.stop()
     else:
-        st.error("Aucune colonne de **Catégorie** détectée. "
-                 "Ajoutez une colonne nommée `Catégorie`, `Categorie`, "
-                 "`Catégorie produit` ou `Categorie produit`, puis réessayez.")
-        st.stop()
+        st.info("Catégorie = **Mots clés** (fallback volontaire).")
 with col2:
-    st.write("Colonnes attendues : **Adresse | Mots clés | Priorité | Catégorie**")
+    st.write("Colonnes minimales : **Adresse | Mots clés**")
 
-# Validation colonnes minimales
-required_cols = ["Adresse", "Mots clés", "Priorité"]
+# Validation colonnes minimales (Priorité devient optionnelle)
+required_cols = ["Adresse", "Mots clés"]
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
     st.error(f"Colonnes manquantes : {', '.join(missing)}")
@@ -411,11 +422,14 @@ cat_state: Dict[str, Dict[str, list]] = {}
 for idx in range(total):
     row = df.iloc[idx]
     keywords = str(row.get("Mots clés", "") or "")
-    category = str(row.get(cat_col, "") or "")
 
-    if not category:
-        st.warning(f"Ligne {idx+2} : catégorie vide — ligne ignorée.")
-        continue
+    if cat_source == "Mots clés (fallback volontaire)":
+        category = keywords
+    else:
+        category = str(row.get(cat_col, "") or "")
+        if not category:
+            st.warning(f"Ligne {idx+2} : catégorie vide — ligne ignorée.")
+            continue
 
     # Éviter de répéter exact les Q déjà présentes (si tu as un historique dans le fichier)
     avoid_line_qs = []
@@ -426,7 +440,7 @@ for idx in range(total):
     try:
         pairs = generate_for_row(
             category=category, keywords=keywords, avoid_line_qs=avoid_line_qs,
-            cat_state=cat_state, attempts=DEFAULT_ATTEMPTS if attempts is None else attempts,
+            cat_state=cat_state, attempts=attempts,
             ans_min=ans_min, ans_max=ans_max, max_qa=max_qa,
             chat_model=chat_model, emb_model=emb_model,
             use_embeddings=use_embeddings, dry_run=dry_run, api_key=api_key,
