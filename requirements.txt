@@ -1,4 +1,5 @@
+streamlit>=1.33
 pandas>=2.0
 openpyxl>=3.1
-tqdm>=4.66
 requests>=2.32
+PyYAML>=6.0  # seulement si tu charges un YAML de règles; sinon tu peux l’ôter
