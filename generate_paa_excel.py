@@ -1,65 +1,148 @@
-# generate_paa_excel.py
+# streamlit_app.py
 # -*- coding: utf-8 -*-
 
-import os, json, time, math, re, argparse, logging
+import os, io, json, time, math, re
 from typing import List, Dict, Tuple, Optional
+import streamlit as st
 import pandas as pd
-from tqdm import tqdm
 import requests
 
-# ====== Config ======
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-EMB_MODEL  = os.getenv("EMB_MODEL",  "text-embedding-3-small")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# =============================
+# Config UI & constantes
+# =============================
+st.set_page_config(page_title="Générateur de PAA (centré produit)", layout="wide")
 
-MAX_QA      = 8
-ANS_MIN     = 80
-ANS_MAX     = 160
-ATTEMPTS    = 3              # tentatives de génération par ligne
-REQ_TIMEOUT = (10, 60)       # (connect timeout, read timeout)
+DEFAULT_SHEET = "MODULES FAQs"
+DEFAULT_QA_COUNT = 8
+DEFAULT_ANS_MIN = 80
+DEFAULT_ANS_MAX = 160
+DEFAULT_ATTEMPTS = 3
+REQ_TIMEOUT = (10, 60)      # (connect timeout, read timeout) secondes
 JACCARD_DUP = 0.82
 COSINE_DUP  = 0.86
 
-SESSION = requests.Session()
+# Modèles (tu peux les adapter)
+DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+DEFAULT_EMB_MODEL  = "text-embedding-3-small"
 
-def api_headers():
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+# =============================
+# Sidebar – Réglages
+# =============================
+st.sidebar.title("⚙️ Réglages")
 
-def _post(url: str, payload: dict, headers: dict, max_retries: int = 4) -> dict:
-    wait = 0.6
-    for attempt in range(max_retries):
-        try:
-            r = SESSION.post(url, headers=headers, data=json.dumps(payload), timeout=REQ_TIMEOUT)
-            if 200 <= r.status_code < 300:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(wait); wait = min(wait*2, 8.0); continue
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        except requests.RequestException as e:
-            if attempt == max_retries-1: raise
-            time.sleep(wait); wait = min(wait*2, 8.0)
-    raise RuntimeError("Échec API après retries")
+chat_model = st.sidebar.text_input("Modèle Chat", os.getenv("CHAT_MODEL", DEFAULT_CHAT_MODEL))
+emb_model  = st.sidebar.text_input("Modèle Embeddings", os.getenv("EMB_MODEL", DEFAULT_EMB_MODEL))
+ans_min    = st.sidebar.number_input("Longueur min réponse", min_value=40, max_value=300, value=DEFAULT_ANS_MIN, step=5)
+ans_max    = st.sidebar.number_input("Longueur max réponse", min_value=60, max_value=400, value=DEFAULT_ANS_MAX, step=5)
+max_qa     = st.sidebar.slider("Nombre de PAA par ligne", 1, 12, DEFAULT_QA_COUNT)
+attempts   = st.sidebar.slider("Tentatives par ligne", 1, 5, DEFAULT_ATTEMPTS)
 
-def openai_chat(messages: List[Dict], temperature: float) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY manquant.")
-    url = "https://api.openai.com/v1/chat/completions"
-    payload = {"model": CHAT_MODEL, "messages": messages, "temperature": temperature, "n": 1}
-    data = _post(url, payload, api_headers())
-    return data["choices"][0]["message"]["content"]
+st.sidebar.markdown("---")
+use_embeddings = st.sidebar.checkbox("Activer dédup sémantique (embeddings)", value=True)
+jaccard_thr    = st.sidebar.slider("Seuil Jaccard (doublon quasi-texte)", 0.5, 0.95, JACCARD_DUP, 0.01)
+cosine_thr     = st.sidebar.slider("Seuil cosinus (doublon sémantique)", 0.6, 0.95, COSINE_DUP, 0.01, disabled=not use_embeddings)
+dry_run        = st.sidebar.checkbox("Dry-run (aucun appel API)", value=False)
+limit_rows     = st.sidebar.number_input("Limiter n premières lignes (0 = toutes)", min_value=0, value=0, step=1)
+st.sidebar.markdown("---")
 
-EMB_CACHE: Dict[str, List[float]] = {}
-def embedding(text: str) -> List[float]:
-    key = text.strip()
-    if key in EMB_CACHE: return EMB_CACHE[key]
-    url = "https://api.openai.com/v1/embeddings"
-    payload = {"model": EMB_MODEL, "input": key}
-    data = _post(url, payload, api_headers())
-    vec = data["data"][0]["embedding"]
-    EMB_CACHE[key] = vec
-    return vec
+st.sidebar.markdown("### 🔐 Clé API")
+api_key_source = st.sidebar.radio("Où lire la clé ?", ["st.secrets", "Variable d'environnement"], index=0)
+st.sidebar.caption("Ajoute OPENAI_API_KEY dans `.streamlit/secrets.toml` ou exporte la variable d’environnement.")
 
-# ====== Similarité / diversité ======
+# =============================
+# Règles d’angles par catégorie
+# =============================
+st.sidebar.markdown("### 📚 Règles de catégories (optionnel)")
+yaml_file = st.sidebar.file_uploader("Charger un YAML de règles (facultatif)", type=["yml", "yaml"])
+
+# Règles intégrées (fallback si pas de YAML)
+DEFAULT_CATEGORY_RULES = [
+    (r"(chaussette|chaussettes|socquettes|mi[-\s]?chaussette)", [
+        "matières & mailles (coton bio peigné, renforts zones d’usure)",
+        "respirabilité & confort au quotidien",
+        "hauteurs & usages (socquettes, ville, sport doux)",
+        "pointures & ajustement (entre deux tailles)",
+        "entretien & durabilité (anti-boulochage sans promesse technique)",
+    ]),
+    (r"(boxer|slip|caleçon|shorty|culotte)", [
+        "confort & maintien (coupes, ceinture douce, coutures plates)",
+        "matières (coton bio, élasticité mesurée, douceur)",
+        "respirabilité & usage quotidien",
+        "choix de la taille et de la coupe",
+        "entretien & longévité (conservation de la tenue)",
+    ]),
+    (r"(t[-\s]?shirt|tee[-\s]?shirt|marinière|top|haut)", [
+        "coupes (droite, ajustée, unisexe) & conseils d’ajustement",
+        "grammage & toucher, tenue du col",
+        "superposition & usages (quotidien, layering)",
+        "guide des tailles et stature",
+        "entretien (lavage, séchage doux) & stabilité",
+    ]),
+    (r"(débardeur|brassière|caraco)", [
+        "coupes (dos, bretelles) & confort",
+        "matières (coton bio, maintien léger)",
+        "usage (sous-pull, été, sport doux)",
+        "guide des tailles (poitrine/torse)",
+        "entretien & stabilité dimensionnelle",
+    ]),
+    (r"(thermique|thermo|grand froid|hiver|isotherme)", [
+        "stratégies de superposition (base layer)",
+        "matières & tricotage favorisant la chaleur ressentie",
+        "respirabilité pour éviter l’humidité",
+        "coupe près du corps vs confort",
+        "entretien pour préserver la performance d’usage",
+    ]),
+    (r"(legging|collant|bas|pantalon doux)", [
+        "opacité, extensibilité & confort",
+        "matières (coton bio) & tenue",
+        "guide des tailles (stature, hanches)",
+        "entretien (lavage doux, séchage)",
+        "usages (ville, homewear, mi-saison)",
+    ]),
+    (r"(pyjama|homewear|loungewear|peignoir)", [
+        "confort & douceur (coupes, finitions)",
+        "respirabilité nocturne (coton bio)",
+        "choix de la taille (coupe ample/ajustée)",
+        "entretien & fréquence de lavage",
+        "mix & match avec d’autres pièces",
+    ]),
+]
+DEFAULT_FALLBACK_ANGLES = [
+    "matières & toucher (coton bio, fibres recyclées adaptées au produit)",
+    "coupe & confort adaptés à l’usage (quotidien, layering, saison)",
+    "guide des tailles (entre-deux, stature, ajustement)",
+    "entretien & longévité (lavage, séchage)",
+    "usages types (ville, intérieur, activité douce)",
+]
+
+def load_category_rules_from_yaml(file) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
+    import yaml  # import tardif pour éviter dépendance si non utilisée
+    data = yaml.safe_load(file)
+    rules = []
+    for r in data.get("rules", []):
+        rules.append((r["match"], r["angles"]))
+    fallback = data.get("fallback", DEFAULT_FALLBACK_ANGLES)
+    return rules, fallback
+
+if yaml_file is not None:
+    try:
+        CATEGORY_RULES, FALLBACK_ANGLES = load_category_rules_from_yaml(yaml_file)
+    except Exception as e:
+        st.sidebar.error(f"YAML invalide : {e}")
+        CATEGORY_RULES, FALLBACK_ANGLES = DEFAULT_CATEGORY_RULES, DEFAULT_FALLBACK_ANGLES
+else:
+    CATEGORY_RULES, FALLBACK_ANGLES = DEFAULT_CATEGORY_RULES, DEFAULT_FALLBACK_ANGLES
+
+# =============================
+# Fonctions utilitaires
+# =============================
+def get_api_key() -> str:
+    if dry_run:
+        return ""  # pas d’API requise
+    if api_key_source == "st.secrets":
+        return st.secrets.get("OPENAI_API_KEY", "")
+    return os.getenv("OPENAI_API_KEY", "")
+
 def normalize(s: str) -> str:
     s = s.lower()
     s = re.sub(r"achel\s+par\s+lemahieu", "maison lemahieu", s, flags=re.I)
@@ -80,66 +163,73 @@ def cosine(u: List[float], v: List[float]) -> float:
     dv  = math.sqrt(sum(y*y for y in v))
     return 0.0 if du == 0 or dv == 0 else num/(du*dv)
 
-# ====== Angles par catégorie (centré PRODUIT) ======
-CATEGORY_RULES: List[Tuple[re.Pattern, List[str]]] = [
-    (re.compile(r"(chaussette|chaussettes|socquettes|mi[-\s]?chaussette)", re.I),
-     ["matières & mailles (coton bio peigné, renforts)",
-      "respirabilité & confort", "hauteurs & usages (socquettes, ville)",
-      "pointures & ajustement", "entretien & durabilité"]),
-    (re.compile(r"(boxer|slip|caleçon|shorty|culotte)", re.I),
-     ["confort & maintien (coupes, ceinture douce)",
-      "matières (coton bio, élasticité)", "respirabilité au quotidien",
-      "guide des tailles/coupe", "entretien & tenue"]),
-    (re.compile(r"(t[-\s]?shirt|tee[-\s]?shirt|marinière|top|haut)", re.I),
-     ["coupes (droite, ajustée, unisexe)", "grammage & toucher, tenue du col",
-      "superposition & usages", "guide des tailles", "entretien & stabilité"]),
-    (re.compile(r"(débardeur|brassière|caraco)", re.I),
-     ["coupes (dos, bretelles) & confort", "matières (coton bio, maintien léger)",
-      "usages (été, sous-pull, sport doux)", "guide des tailles", "entretien & stabilité"]),
-    (re.compile(r"(thermique|thermo|grand froid|hiver|isotherme)", re.I),
-     ["base layer & superposition", "matières favorisant la chaleur ressentie",
-      "respirabilité (éviter l’humidité)", "coupe près du corps vs confort",
-      "entretien pour préserver l’usage"]),
-    (re.compile(r"(legging|collant|bas|pantalon doux)", re.I),
-     ["opacité & extensibilité", "matières (coton bio) & tenue",
-      "guide des tailles (stature, hanches)", "entretien (lavage doux)",
-      "usages (ville, homewear)"]),
-    (re.compile(r"(pyjama|homewear|loungewear|peignoir)", re.I),
-     ["confort & douceur", "respirabilité nocturne",
-      "choix de la taille (ample/ajusté)", "entretien & fréquence", "mix & match"]),
-]
-FALLBACK_ANGLES = [
-    "matières & toucher (coton bio, fibres recyclées)",
-    "coupe & confort adaptés à l’usage",
-    "guide des tailles (entre-deux, stature)",
-    "entretien & longévité (lavage, séchage)",
-    "usages types (quotidien, layering, saison)"
-]
-
 def angles_for_category(category_or_kw: str) -> List[str]:
     text = (category_or_kw or "").lower()
     for pat, angles in CATEGORY_RULES:
-        if pat.search(text): return angles
+        if re.search(pat, text, flags=re.I):  # pat est une chaîne regex
+            return angles
     return FALLBACK_ANGLES
 
-# ====== Prompting ======
-def system_prompt() -> str:
+# =============================
+# OpenAI – wrappers (requests)
+# =============================
+SESSION = requests.Session()
+EMB_CACHE: Dict[str, List[float]] = {}
+
+def _post_with_retries(url: str, payload: dict, headers: dict,
+                       max_retries: int = 4) -> dict:
+    wait = 0.6
+    for _ in range(max_retries):
+        try:
+            r = SESSION.post(url, headers=headers, data=json.dumps(payload),
+                             timeout=REQ_TIMEOUT)
+            if 200 <= r.status_code < 300:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(wait); wait = min(wait*2, 8.0); continue
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+        except requests.RequestException:
+            time.sleep(wait); wait = min(wait*2, 8.0)
+    raise RuntimeError("Échec API après retries")
+
+def openai_chat(messages: List[Dict], model: str, temperature: float, api_key: str) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {"model": model, "messages": messages, "temperature": temperature, "n": 1}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    data = _post_with_retries(url, payload, headers)
+    return data["choices"][0]["message"]["content"]
+
+def get_embedding(text: str, model: str, api_key: str) -> List[float]:
+    key = text.strip()
+    if key in EMB_CACHE: return EMB_CACHE[key]
+    url = "https://api.openai.com/v1/embeddings"
+    payload = {"model": model, "input": key}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    data = _post_with_retries(url, payload, headers)
+    vec = data["data"][0]["embedding"]
+    EMB_CACHE[key] = vec
+    return vec
+
+# =============================
+# Prompting
+# =============================
+def system_prompt(ans_min: int, ans_max: int) -> str:
     return (
-        "Tu es un rédacteur SEO e-commerce. Crée des paires Q/R (People Also Ask) "
+        "Tu es un rédacteur SEO e-commerce. Tu crées des paires Q/R (People Also Ask) "
         "centrées sur le TYPE DE PRODUIT, pas la marque.\n"
-        f"- 1 idée par question, réponses {ANS_MIN}-{ANS_MAX} caractères.\n"
+        f"- 1 idée par question, réponses {ans_min}-{ans_max} caractères.\n"
         "- Pas de prix/promo/médical/superlatifs absolus. Français clair, vouvoiement.\n"
         '- Règle: remplacer "Achel par Lemahieu" par "Maison Lemahieu".'
     )
 
 def user_prompt(category: str, keywords: str, angles: List[str],
-                avoid_questions: List[str], need: int) -> str:
+                avoid_questions: List[str], need: int, ans_min: int, ans_max: int) -> str:
     obj = {
         "task": f"Générer {need} paires Q/R PAA pour une page produit.",
         "category": category, "keywords": keywords,
         "angles_prioritaires": angles,
         "constraints": {
-            "answers_length": f"{ANS_MIN}-{ANS_MAX}",
+            "answers_length": f"{ans_min}-{ans_max}",
             "one_idea_per_question": True,
             "no_prices_no_promos": True,
             "no_medical_claims": True,
@@ -150,7 +240,7 @@ def user_prompt(category: str, keywords: str, angles: List[str],
     }
     return json.dumps(obj, ensure_ascii=False)
 
-def parse_pairs(text: str) -> List[Dict[str, str]]:
+def parse_pairs(text: str, ans_min: int, ans_max: int) -> List[Dict[str,str]]:
     try:
         data = json.loads(text)
     except Exception:
@@ -165,14 +255,20 @@ def parse_pairs(text: str) -> List[Dict[str, str]]:
         if not q or not a: continue
         q = re.sub(r"achel\s+par\s+lemahieu", "Maison Lemahieu", q, flags=re.I)
         a = re.sub(r"achel\s+par\s+lemahieu", "Maison Lemahieu", a, flags=re.I)
-        if ANS_MIN <= len(a) <= ANS_MAX:
+        if ans_min <= len(a) <= ans_max:
             out.append({"q": q, "a": a})
     return out
 
-# ====== Génération & diversité ======
+# =============================
+# Génération d’une ligne
+# =============================
 def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
                      cat_state: Dict[str, Dict[str, list]],
-                     attempts: int, dry_run: bool, verbose: bool) -> List[Dict[str,str]]:
+                     attempts: int, ans_min: int, ans_max: int,
+                     max_qa: int, chat_model: str, emb_model: str,
+                     use_embeddings: bool, dry_run: bool, api_key: str,
+                     jaccard_thr: float, cosine_thr: float) -> List[Dict[str,str]]:
+
     cat_key = category or keywords or "_GLOBAL_"
     if cat_key not in cat_state: cat_state[cat_key] = {"qs": [], "embs": []}
 
@@ -180,141 +276,181 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
     avoid_norm = {normalize(q) for q in avoid_line_qs}
 
     for attempt in range(attempts):
-        # Génération candidates
+        # Candidats
         if dry_run:
             candidates = [
                 {"q": f"{(category or keywords).strip()}: {a.split('(')[0].strip()} ?",
                  "a": (f"Réponse synthétique sur {a.split('(')[0].strip()}, "
-                       f"orientée usage et entretien. Choisissez une taille adaptée.")[:ANS_MAX]}
+                       f"orientée usage et entretien. Choisissez une taille adaptée.")[:ans_max]}
                 for a in angles
-            ][:MAX_QA]
+            ][:max_qa]
         else:
             content = openai_chat(
-                [{"role":"system","content":system_prompt()},
-                 {"role":"user","content":user_prompt(category, keywords, angles, list(avoid_norm), MAX_QA)}],
-                temperature=0.35 if attempt == 0 else 0.6
+                [{"role":"system","content":system_prompt(ans_min, ans_max)},
+                 {"role":"user","content":user_prompt(category, keywords, angles, list(avoid_norm), max_qa, ans_min, ans_max)}],
+                model=chat_model, temperature=0.35 if attempt == 0 else 0.6, api_key=api_key
             )
-            candidates = parse_pairs(content)
+            candidates = parse_pairs(content, ans_min, ans_max)
 
-        # 1) Filtre Jaccard intra-ligne + vs historique catégorie
+        # Filtre Jaccard intra-ligne + historique catégorie
         filtered: List[Dict[str,str]] = []
         for p in candidates:
             q = p["q"]
-            if normalize(q) in avoid_norm:       # évite exactes/voisines à la ligne
+            if normalize(q) in avoid_norm:
                 continue
-            if any(jaccard(q, x["q"]) >= JACCARD_DUP for x in filtered):
+            if any(jaccard(q, x["q"]) >= jaccard_thr for x in filtered):
                 continue
-            if any(jaccard(q, hq) >= JACCARD_DUP for hq in cat_state[cat_key]["qs"]):
+            if any(jaccard(q, hq) >= jaccard_thr for hq in cat_state[cat_key]["qs"]):
                 continue
             filtered.append(p)
-            if len(filtered) == MAX_QA: break
+            if len(filtered) == max_qa: break
 
-        # 2) Filtre embeddings (sémantique) intra-ligne + historique
-        if not dry_run and filtered:
-            cand_embs = [embedding(p["q"]) for p in filtered]
+        # Filtre embeddings (sémantique)
+        if use_embeddings and not dry_run and filtered:
+            cand_embs = [get_embedding(p["q"], emb_model, api_key) for p in filtered]
             keep = []
             for i, ei in enumerate(cand_embs):
                 ok = True
                 for j in keep:
-                    if cosine(ei, cand_embs[j]) >= COSINE_DUP:
+                    if cosine(ei, cand_embs[j]) >= cosine_thr:
                         ok = False; break
                 if ok:
                     for eh in cat_state[cat_key]["embs"]:
-                        if cosine(ei, eh) >= COSINE_DUP:
+                        if cosine(ei, eh) >= cosine_thr:
                             ok = False; break
                 if ok: keep.append(i)
             filtered = [filtered[k] for k in keep]
 
-        if verbose: logging.info(f"[{cat_key}] tentative {attempt+1}: {len(filtered)} retenues")
-        final = filtered[:MAX_QA]
-
-        # mise à jour historique
+        final = filtered[:max_qa]
+        # MàJ historique
         cat_state[cat_key]["qs"].extend([p["q"] for p in final])
-        if not dry_run:
-            cat_state[cat_key]["embs"].extend([embedding(p["q"]) for p in final])
+        if use_embeddings and not dry_run:
+            cat_state[cat_key]["embs"].extend([get_embedding(p["q"], emb_model, api_key) for p in final])
 
-        if len(final) >= max(5, MAX_QA-2) or attempt == attempts-1:
+        # suffisant ? sinon retente
+        if len(final) >= max(5, max_qa - 2) or attempt == attempts - 1:
             return final
-        time.sleep(0.5 if not dry_run else 0.05)
+        time.sleep(0.4 if not dry_run else 0.05)
 
     return []
 
-# ====== Excel ======
-def load_excel(path: str, sheet: str) -> pd.DataFrame:
-    return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+# =============================
+# UI principale
+# =============================
+st.title("🧩 Générateur de PAA – Centré produit")
 
-def save_excel(df: pd.DataFrame, path: str):
-    df.to_excel(path, index=False, engine="openpyxl")
+st.markdown("""
+Charge un **Excel** et génère des **People Also Ask** variés, adaptés à chaque **catégorie/keyword**.  
+- Forte **diversité** (Jaccard + embeddings optionnels)  
+- Règle marque : “Achel par Lemahieu” → **“Maison Lemahieu”**  
+- Résultats **Q1..Q8 / A1..A8** réécrits/complétés dans un **nouvel Excel** téléchargeable.
+""")
 
-# ====== Main ======
-def main():
-    ap = argparse.ArgumentParser(description="Génération PAA (Excel in/out), centrée PRODUIT, forte diversité.")
-    ap.add_argument("--input", required=True, help="Chemin Excel source")
-    ap.add_argument("--sheet", default="MODULES FAQs", help="Nom d'onglet source (par défaut: MODULES FAQs)")
-    ap.add_argument("--output", default="output_paa.xlsx", help="Excel de sortie")
-    ap.add_argument("--max-rows", type=int, default=None, help="Limiter le nb de lignes (debug)")
-    ap.add_argument("--attempts", type=int, default=ATTEMPTS, help="Tentatives par ligne")
-    ap.add_argument("--dry-run", action="store_true", help="Aucun appel API (test E/S)")
-    ap.add_argument("--verbose", action="store_true", help="Logs détaillés")
-    args = ap.parse_args()
+uploaded = st.file_uploader("📄 Fichier Excel d’entrée", type=["xlsx"])
+if not uploaded:
+    st.info("Charge ton fichier `.xlsx` pour commencer.")
+    st.stop()
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
-                        format="%(asctime)s %(levelname)s %(message)s")
+# Prévisualisation & choix d’onglet
+xls = pd.ExcelFile(uploaded)
+sheet_name = st.selectbox("Onglet à utiliser", options=xls.sheet_names, index=(xls.sheet_names.index(DEFAULT_SHEET) if DEFAULT_SHEET in xls.sheet_names else 0))
+df = pd.read_excel(uploaded, sheet_name=sheet_name, engine="openpyxl")
 
-    if not args.dry_run and not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY manquant. export OPENAI_API_KEY=...")
+st.write("Aperçu (5 premières lignes) :")
+st.dataframe(df.head())
 
-    df = load_excel(args.input, args.sheet)
+# Détection éventuelle de la colonne Catégorie
+cat_col = None
+for cand in ["Catégorie", "Categorie", "Catégorie produit", "Categorie produit"]:
+    if cand in df.columns:
+        cat_col = cand; break
 
-    # Vérifs colonnes
-    for col in ["Adresse", "Mots clés", "Priorité"]:
-        if col not in df.columns:
-            raise ValueError(f"Colonne obligatoire manquante: {col}")
+col1, col2 = st.columns(2)
+with col1:
+    if cat_col:
+        st.success(f"Colonne de Catégorie détectée : **{cat_col}**")
+    else:
+        st.warning("Aucune colonne de Catégorie détectée — fallback sur **Mots clés**.")
+with col2:
+    st.write("Colonnes attendues minimales : **Adresse | Mots clés | Priorité**")
 
-    out = df.copy()
+# Mapping/validation colonnes de base
+required_cols = ["Adresse", "Mots clés", "Priorité"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    st.error(f"Colonnes manquantes : {', '.join(missing)}")
+    st.stop()
 
-    # Colonnes Q/A garanties
-    q_cols = [f"Q{i}" for i in range(1, MAX_QA+1)]
-    a_cols = [f"A{i}" for i in range(1, MAX_QA+1)]
-    for qc, ac in zip(q_cols, a_cols):
-        if qc not in out.columns: out[qc] = ""
-        if ac not in out.columns: out[ac] = ""
+# Ajouter colonnes Q/A si absentes
+q_cols = [f"Q{i}" for i in range(1, max_qa+1)]
+a_cols = [f"A{i}" for i in range(1, max_qa+1)]
+for qc, ac in zip(q_cols, a_cols):
+    if qc not in df.columns: df[qc] = ""
+    if ac not in df.columns: df[ac] = ""
 
-    # repère colonne catégorie optionnelle
-    cat_col = None
-    for cand in ["Catégorie", "Categorie", "Catégorie produit", "Categorie produit"]:
-        if cand in df.columns: cat_col = cand; break
+# Bouton lancer
+start = st.button("🚀 Générer les PAA")
+if not start:
+    st.stop()
 
-    total = len(df) if args.max_rows is None else min(args.max_rows, len(df))
-    pbar = tqdm(total=total, desc="Génération PAA", unit="ligne")
-    cat_state: Dict[str, Dict[str, list]] = {}
+# Vérif clé API si nécessaire
+api_key = get_api_key()
+if not dry_run and not api_key:
+    st.error("Aucune clé API détectée. Ajoute `OPENAI_API_KEY` dans `st.secrets` ou en variable d’environnement, ou coche Dry-run.")
+    st.stop()
 
-    for idx in range(total):
-        row = df.iloc[idx]
-        keywords = str(row.get("Mots clés", "") or "")
-        category = str(row.get(cat_col, "") or "") if cat_col else keywords
+# Pipeline
+out = df.copy()
+total = len(df) if limit_rows == 0 else min(limit_rows, len(df))
+progress = st.progress(0, text="Démarrage…")
+log_area = st.empty()
 
-        # éviter les questions déjà présentes (si ton fichier en contient)
-        avoid_line_qs = []
-        for qc in q_cols:
-            v = str(row.get(qc, "") or "").strip()
-            if v: avoid_line_qs.append(v)
+cat_state: Dict[str, Dict[str, list]] = {}
+for idx in range(total):
+    row = df.iloc[idx]
+    keywords = str(row.get("Mots clés", "") or "")
+    category = str(row.get(cat_col, "") or "") if cat_col else keywords
 
+    # Éviter de répéter exact les Q déjà présentes (si tu as un historique)
+    avoid_line_qs = []
+    for qc in q_cols:
+        v = str(row.get(qc, "") or "").strip()
+        if v: avoid_line_qs.append(v)
+
+    try:
         pairs = generate_for_row(
-            category, keywords, avoid_line_qs,
-            cat_state=cat_state, attempts=args.attempts,
-            dry_run=args.dry_run, verbose=args.verbose
+            category=category, keywords=keywords, avoid_line_qs=avoid_line_qs,
+            cat_state=cat_state, attempts=attempts,
+            ans_min=ans_min, ans_max=ans_max, max_qa=max_qa,
+            chat_model=chat_model, emb_model=emb_model,
+            use_embeddings=use_embeddings, dry_run=dry_run, api_key=api_key,
+            jaccard_thr=jaccard_thr, cosine_thr=cosine_thr
         )
+    except Exception as e:
+        st.error(f"Erreur à la ligne {idx+2} : {e}")
+        pairs = []
 
-        for i in range(MAX_QA):
-            out.at[idx, q_cols[i]] = pairs[i]["q"] if i < len(pairs) else ""
-            out.at[idx, a_cols[i]] = pairs[i]["a"] if i < len(pairs) else ""
+    for i in range(max_qa):
+        out.at[idx, q_cols[i]] = pairs[i]["q"] if i < len(pairs) else ""
+        out.at[idx, a_cols[i]] = pairs[i]["a"] if i < len(pairs) else ""
 
-        pbar.update(1)
+    progress.progress((idx+1)/total, text=f"Lignes traitées : {idx+1}/{total}")
+    if (idx+1) % 5 == 0 or idx == total-1:
+        log_area.info(f"[{idx+1}/{total}] Catégorie: {category[:60]} — Q générées: {len(pairs)}")
 
-    pbar.close()
-    save_excel(out, args.output)
-    print(f"✅ Terminé. Fichier écrit : {args.output}")
+progress.empty()
+st.success("✅ Terminé !")
 
-if __name__ == "__main__":
-    main()
+# Export Excel en mémoire + bouton de téléchargement
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    out.to_excel(writer, index=False, sheet_name=sheet_name)
+buf.seek(0)
+st.download_button(
+    label="💾 Télécharger l’Excel de sortie",
+    data=buf,
+    file_name="output_paa.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+st.caption("Astuce : utilise **Dry-run** pour valider le flux sans consommer l’API. Active ensuite les embeddings pour maximiser la diversité.")
