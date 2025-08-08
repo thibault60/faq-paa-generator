@@ -21,7 +21,7 @@ REQ_TIMEOUT = (10, 60)      # (connect timeout, read timeout) secondes
 JACCARD_DUP = 0.82
 COSINE_DUP  = 0.86
 
-# Modèles (tu peux les adapter)
+# Modèles par défaut
 DEFAULT_CHAT_MODEL = "gpt-4o-mini"
 DEFAULT_EMB_MODEL  = "text-embedding-3-small"
 
@@ -50,7 +50,7 @@ api_key_source = st.sidebar.radio("Où lire la clé ?", ["st.secrets", "Variable
 st.sidebar.caption("Ajoute OPENAI_API_KEY dans `.streamlit/secrets.toml` ou exporte la variable d’environnement.")
 
 # =============================
-# Règles d’angles par catégorie
+# Règles d’angles par catégorie (optionnel YAML)
 # =============================
 st.sidebar.markdown("### 📚 Règles de catégories (optionnel)")
 yaml_file = st.sidebar.file_uploader("Charger un YAML de règles (facultatif)", type=["yml", "yaml"])
@@ -116,7 +116,7 @@ DEFAULT_FALLBACK_ANGLES = [
 ]
 
 def load_category_rules_from_yaml(file) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
-    import yaml  # import tardif pour éviter dépendance si non utilisée
+    import yaml  # import tardif
     data = yaml.safe_load(file)
     rules = []
     for r in data.get("rules", []):
@@ -134,7 +134,7 @@ else:
     CATEGORY_RULES, FALLBACK_ANGLES = DEFAULT_CATEGORY_RULES, DEFAULT_FALLBACK_ANGLES
 
 # =============================
-# Fonctions utilitaires
+# Utilitaires
 # =============================
 def get_api_key() -> str:
     if dry_run:
@@ -163,8 +163,8 @@ def cosine(u: List[float], v: List[float]) -> float:
     dv  = math.sqrt(sum(y*y for y in v))
     return 0.0 if du == 0 or dv == 0 else num/(du*dv)
 
-def angles_for_category(category_or_kw: str) -> List[str]:
-    text = (category_or_kw or "").lower()
+def angles_for_category(category_text: str) -> List[str]:
+    text = (category_text or "").lower()
     for pat, angles in CATEGORY_RULES:
         if re.search(pat, text, flags=re.I):  # pat est une chaîne regex
             return angles
@@ -176,13 +176,11 @@ def angles_for_category(category_or_kw: str) -> List[str]:
 SESSION = requests.Session()
 EMB_CACHE: Dict[str, List[float]] = {}
 
-def _post_with_retries(url: str, payload: dict, headers: dict,
-                       max_retries: int = 4) -> dict:
+def _post_with_retries(url: str, payload: dict, headers: dict, max_retries: int = 4) -> dict:
     wait = 0.6
     for _ in range(max_retries):
         try:
-            r = SESSION.post(url, headers=headers, data=json.dumps(payload),
-                             timeout=REQ_TIMEOUT)
+            r = SESSION.post(url, headers=headers, data=json.dumps(payload), timeout=REQ_TIMEOUT)
             if 200 <= r.status_code < 300:
                 return r.json()
             if r.status_code in (429, 500, 502, 503, 504):
@@ -269,17 +267,17 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
                      use_embeddings: bool, dry_run: bool, api_key: str,
                      jaccard_thr: float, cosine_thr: float) -> List[Dict[str,str]]:
 
-    cat_key = category or keywords or "_GLOBAL_"
+    cat_key = category or "_GLOBAL_"
     if cat_key not in cat_state: cat_state[cat_key] = {"qs": [], "embs": []}
 
-    angles = angles_for_category(category or keywords)
+    angles = angles_for_category(category)
     avoid_norm = {normalize(q) for q in avoid_line_qs}
 
     for attempt in range(attempts):
         # Candidats
         if dry_run:
             candidates = [
-                {"q": f"{(category or keywords).strip()}: {a.split('(')[0].strip()} ?",
+                {"q": f"{category.strip()}: {a.split('(')[0].strip()} ?",
                  "a": (f"Réponse synthétique sur {a.split('(')[0].strip()}, "
                        f"orientée usage et entretien. Choisissez une taille adaptée.")[:ans_max]}
                 for a in angles
@@ -340,7 +338,7 @@ def generate_for_row(category: str, keywords: str, avoid_line_qs: List[str],
 st.title("🧩 Générateur de PAA – Centré produit")
 
 st.markdown("""
-Charge un **Excel** et génère des **People Also Ask** variés, adaptés à chaque **catégorie/keyword**.  
+Charge un **Excel** et génère des **People Also Ask** variés, adaptés à chaque **catégorie**.  
 - Forte **diversité** (Jaccard + embeddings optionnels)  
 - Règle marque : “Achel par Lemahieu” → **“Maison Lemahieu”**  
 - Résultats **Q1..Q8 / A1..A8** réécrits/complétés dans un **nouvel Excel** téléchargeable.
@@ -359,22 +357,26 @@ df = pd.read_excel(uploaded, sheet_name=sheet_name, engine="openpyxl")
 st.write("Aperçu (5 premières lignes) :")
 st.dataframe(df.head())
 
-# Détection éventuelle de la colonne Catégorie
+# Détection OBLIGATOIRE de la colonne Catégorie (aucun fallback Mots clés)
 cat_col = None
 for cand in ["Catégorie", "Categorie", "Catégorie produit", "Categorie produit"]:
     if cand in df.columns:
-        cat_col = cand; break
+        cat_col = cand
+        break
 
 col1, col2 = st.columns(2)
 with col1:
     if cat_col:
         st.success(f"Colonne de Catégorie détectée : **{cat_col}**")
     else:
-        st.warning("Aucune colonne de Catégorie détectée — fallback sur **Mots clés**.")
+        st.error("Aucune colonne de **Catégorie** détectée. "
+                 "Ajoutez une colonne nommée `Catégorie`, `Categorie`, "
+                 "`Catégorie produit` ou `Categorie produit`, puis réessayez.")
+        st.stop()
 with col2:
-    st.write("Colonnes attendues minimales : **Adresse | Mots clés | Priorité**")
+    st.write("Colonnes attendues : **Adresse | Mots clés | Priorité | Catégorie**")
 
-# Mapping/validation colonnes de base
+# Validation colonnes minimales
 required_cols = ["Adresse", "Mots clés", "Priorité"]
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
@@ -409,9 +411,13 @@ cat_state: Dict[str, Dict[str, list]] = {}
 for idx in range(total):
     row = df.iloc[idx]
     keywords = str(row.get("Mots clés", "") or "")
-    category = str(row.get(cat_col, "") or "") if cat_col else keywords
+    category = str(row.get(cat_col, "") or "")
 
-    # Éviter de répéter exact les Q déjà présentes (si tu as un historique)
+    if not category:
+        st.warning(f"Ligne {idx+2} : catégorie vide — ligne ignorée.")
+        continue
+
+    # Éviter de répéter exact les Q déjà présentes (si tu as un historique dans le fichier)
     avoid_line_qs = []
     for qc in q_cols:
         v = str(row.get(qc, "") or "").strip()
@@ -420,7 +426,7 @@ for idx in range(total):
     try:
         pairs = generate_for_row(
             category=category, keywords=keywords, avoid_line_qs=avoid_line_qs,
-            cat_state=cat_state, attempts=attempts,
+            cat_state=cat_state, attempts=DEFAULT_ATTEMPTS if attempts is None else attempts,
             ans_min=ans_min, ans_max=ans_max, max_qa=max_qa,
             chat_model=chat_model, emb_model=emb_model,
             use_embeddings=use_embeddings, dry_run=dry_run, api_key=api_key,
